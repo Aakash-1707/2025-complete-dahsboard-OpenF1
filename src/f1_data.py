@@ -12,6 +12,7 @@ import pandas as pd
 from src.lib.settings import get_settings
 from src.lib.time import parse_time_string
 from src.lib.tyres import get_tyre_compound_int
+from src import openf1_data as openf1
 
 
 def enable_cache():
@@ -176,7 +177,6 @@ def get_race_telemetry(session, session_type="R"):
     cache_suffix = "sprint" if session_type == "S" else "race"
 
     # Check if this data has already been computed
-
     try:
         if "--refresh-data" not in sys.argv:
             with open(
@@ -201,7 +201,6 @@ def get_race_telemetry(session, session_type="R"):
     max_lap_number = 0
 
     # 1. Get all of the drivers telemetry data using multiprocessing
-    # Prepare arguments for parallel processing
     print(f"Processing {len(drivers)} drivers in parallel...")
     driver_args = [
         (driver_no, session, driver_codes[driver_no]) for driver_no in drivers
@@ -234,7 +233,7 @@ def get_race_telemetry(session, session_type="R"):
     # 2. Create a timeline (start from zero)
     timeline = np.arange(global_t_min, global_t_max, DT) - global_t_min
 
-    # 3. Resample each driver's telemetry (x, y, gap) onto the common timeline
+    # 3. Resample each driver's telemetry onto the common timeline
     resampled_data = {}
     max_tyre_life_map = {}
 
@@ -245,7 +244,6 @@ def get_race_telemetry(session, session_type="R"):
         order = np.argsort(t)
         t_sorted = t[order]
 
-        # Vectorize all resampling in one operation for speed
         arrays_to_resample = [
             data["x"][order],
             data["y"][order],
@@ -269,7 +267,7 @@ def get_race_telemetry(session, session_type="R"):
             "t": timeline,
             "x": x_resampled,
             "y": y_resampled,
-            "dist": dist_resampled,  # race distance (metres since Lap 1 start)
+            "dist": dist_resampled,
             "rel_dist": rel_dist_resampled,
             "lap": lap_resampled,
             "tyre": tyre_resampled,
@@ -287,19 +285,14 @@ def get_race_telemetry(session, session_type="R"):
             if not np.isnan(c_max):
                 max_tyre_life_map[int(t_int)] = max(max_tyre_life_map.get(int(t_int), 1), int(c_max))
 
-    # 4. Incorporate track status data into the timeline (for safety car, VSC, etc.)
-
+    # 4. Incorporate track status data (FastF1 baseline)
     track_status = session.track_status
-
     formatted_track_statuses = []
 
     for status in track_status.to_dict("records"):
         seconds = timedelta.total_seconds(status["Time"])
-
-        start_time = seconds - global_t_min  # Shift to match timeline
+        start_time = seconds - global_t_min
         end_time = None
-
-        # Set the end time of the previous status
 
         if formatted_track_statuses:
             formatted_track_statuses[-1]["end_time"] = start_time
@@ -312,7 +305,7 @@ def get_race_telemetry(session, session_type="R"):
             }
         )
 
-    # 4.1. Resample weather data onto the same timeline for playback
+    # 4.1. Resample weather data onto the same timeline
     weather_resampled = None
     weather_df = getattr(session, "weather_data", None)
     if weather_df is not None and not weather_df.empty:
@@ -363,14 +356,13 @@ def get_race_telemetry(session, session_type="R"):
     frames = []
     num_frames = len(timeline)
 
-    # Pre-extract data references for faster access
-    driver_codes = list(resampled_data.keys())
-    driver_arrays = {code: resampled_data[code] for code in driver_codes}
+    driver_codes_list = list(resampled_data.keys())
+    driver_arrays = {code: resampled_data[code] for code in driver_codes_list}
 
     for i in range(num_frames):
         t = timeline[i]
         snapshot = []
-        for code in driver_codes:
+        for code in driver_codes_list:
             d = driver_arrays[code]
             snapshot.append({
                 "code": code,
@@ -388,27 +380,20 @@ def get_race_telemetry(session, session_type="R"):
                 "brake": float(d['brake'][i]),
             })
 
-        # If for some reason we have no drivers at this instant
         if not snapshot:
             continue
 
-        # 5b. Sort by race distance to get POSITIONS (1–20)
-        # Leader = largest race distance covered
         snapshot.sort(key=lambda r: (r.get("lap", 0), r["dist"]), reverse=True)
 
         leader = snapshot[0]
         leader_lap = leader["lap"]
 
-        # TODO: This 5c. step seems futile currently as we are not using gaps anywhere, and it doesn't even comput the gaps. I think I left this in when removing the "gaps" feature that was half-finished during the initial development.
-
-        # 5c. Compute gap to car in front in SECONDS
         frame_data = {}
 
         for idx, car in enumerate(snapshot):
             code = car["code"]
             position = idx + 1
 
-            # include speed, gear, drs_active in frame driver dict
             frame_data[code] = {
                 "x": car["x"],
                 "y": car["y"],
@@ -423,6 +408,9 @@ def get_race_telemetry(session, session_type="R"):
                 "drs": car["drs"],
                 "throttle": car["throttle"],
                 "brake": car["brake"],
+                # OpenF1 gap fields — populated below if enrichment succeeds
+                "gap_to_leader": 0.0,
+                "interval": 0.0,
             }
 
         weather_snapshot = {}
@@ -453,50 +441,145 @@ def get_race_telemetry(session, session_type="R"):
 
         frame_payload = {
             "t": round(t, 3),
-            "lap": leader_lap,  # leader's lap at this time
+            "lap": leader_lap,
             "drivers": frame_data,
         }
         if weather_snapshot:
             frame_payload["weather"] = weather_snapshot
 
         frames.append(frame_payload)
-    print("completed telemetry extraction...")
+
+    print("Completed FastF1 telemetry extraction...")
+
+    # -------------------------------------------------------------------------
+    # 6. OpenF1 Enrichment
+    #    Adds: gap_to_leader, interval per driver per frame
+    #          race control messages per frame (for banner notifications)
+    #          better track_statuses (replaces FastF1 version if available)
+    #          pit_events and radio_events (returned in the data dict)
+    # -------------------------------------------------------------------------
+    pit_events: dict = {}
+    radio_events: dict = {}
+    openf1_available = False
+
+    print("Attempting OpenF1 enrichment...")
+    try:
+        session_key = openf1.get_session_key_from_session(session)
+
+        if session_key:
+            print(f"[OpenF1] Found session_key={session_key}. Fetching enrichment data...")
+
+            driver_num_map = openf1.build_driver_number_map(session)
+            session_start_utc: float = session.date.timestamp()
+
+            # 6a. Intervals — gap_to_leader and interval per driver
+            print("[OpenF1] Fetching intervals...")
+            intervals_raw = openf1.get_intervals(session_key)
+            if intervals_raw:
+                intervals_by_driver = openf1.build_openf1_intervals(
+                    intervals_raw,
+                    driver_num_map,
+                    session_start_utc,
+                    global_t_min,
+                    timeline,
+                )
+                for i, frame in enumerate(frames):
+                    for code, idata in intervals_by_driver.items():
+                        if code in frame["drivers"]:
+                            frame["drivers"][code]["gap_to_leader"] = round(
+                                float(idata["gap_to_leader"][i]), 3
+                            )
+                            frame["drivers"][code]["interval"] = round(
+                                float(idata["interval"][i]), 3
+                            )
+                print(f"[OpenF1] Intervals injected for {len(intervals_by_driver)} drivers.")
+
+            # 6b. Race control messages — enrich track_statuses + per-frame events
+            print("[OpenF1] Fetching race control messages...")
+            rc_messages = openf1.get_race_control_messages(session_key)
+            if rc_messages:
+                # Build better track statuses from OpenF1 flag messages
+                openf1_statuses = openf1.build_openf1_track_statuses(
+                    rc_messages, session_start_utc, global_t_min
+                )
+                if openf1_statuses:
+                    # Replace the FastF1-derived track statuses with the richer OpenF1 version
+                    formatted_track_statuses = openf1_statuses
+                    print(f"[OpenF1] Replaced track statuses with {len(openf1_statuses)} OpenF1 events.")
+
+                # Attach individual race control messages to the relevant frames
+                # so the UI can display banner notifications
+                frame_rc_events = openf1.build_openf1_race_control_for_frames(
+                    rc_messages,
+                    session_start_utc,
+                    global_t_min,
+                    FPS,
+                    len(frames),
+                )
+                for frame_idx, events in frame_rc_events.items():
+                    if 0 <= frame_idx < len(frames):
+                        frames[frame_idx]["race_control"] = events
+
+                print(f"[OpenF1] Race control: {len(frame_rc_events)} frame(s) annotated.")
+
+            # 6c. Pit stops
+            print("[OpenF1] Fetching pit stop data...")
+            pit_raw = openf1.get_pit_stops(session_key)
+            if pit_raw:
+                pit_events = openf1.build_openf1_pit_events(pit_raw, driver_num_map)
+                print(f"[OpenF1] Pit events loaded for {len(pit_events)} drivers.")
+
+            # 6d. Team radio
+            print("[OpenF1] Fetching team radio...")
+            radio_raw = openf1.get_team_radio(session_key)
+            if radio_raw:
+                radio_events = openf1.build_openf1_radio_events(
+                    radio_raw, driver_num_map, session_start_utc, global_t_min
+                )
+                print(f"[OpenF1] Radio events loaded for {len(radio_events)} drivers.")
+
+            openf1_available = True
+            print("[OpenF1] Enrichment complete ✓")
+
+        else:
+            print("[OpenF1] Session key not found — using FastF1 data only.")
+
+    except Exception as e:
+        print(f"[OpenF1] Enrichment failed (non-critical, continuing with FastF1 only): {e}")
+
+    # -------------------------------------------------------------------------
+    # 7. Persist to cache
+    # -------------------------------------------------------------------------
     print("Saving to cache file...")
-    # If computed_data/ directory doesn't exist, create it
     if not os.path.exists("computed_data"):
         os.makedirs("computed_data")
 
-    # Save using pickle (10-100x faster than JSON)
-    with open(f"computed_data/{event_name}_{cache_suffix}_telemetry.pkl", "wb") as f:
-        pickle.dump({
-            "frames": frames,
-            "driver_colors": get_driver_colors(session),
-            "track_statuses": formatted_track_statuses,
-            "total_laps": int(max_lap_number),
-            "max_tyre_life": max_tyre_life_map,
-        }, f, protocol=pickle.HIGHEST_PROTOCOL)
-
-    print("Saved Successfully!")
-    print("The replay should begin in a new window shortly")
-    return {
+    cache_payload = {
         "frames": frames,
         "driver_colors": get_driver_colors(session),
         "track_statuses": formatted_track_statuses,
         "total_laps": int(max_lap_number),
         "max_tyre_life": max_tyre_life_map,
+        # OpenF1 extras
+        "pit_events": pit_events,
+        "radio_events": radio_events,
+        "openf1_available": openf1_available,
     }
+
+    with open(f"computed_data/{event_name}_{cache_suffix}_telemetry.pkl", "wb") as f:
+        pickle.dump(cache_payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    print("Saved successfully!")
+    print("The replay should begin in a new window shortly.")
+    return cache_payload
 
 
 def get_qualifying_results(session):
-    # Extract the qualifying results and return a list of the drivers, their positions and their lap times in each qualifying segment
-
     results = session.results
-
     qualifying_data = []
 
     for _, row in results.iterrows():
         driver_code = row["Abbreviation"]
-        # Skip drivers with no position (DNF/DNS/no lap data)
         if pd.isna(row["Position"]):
             continue
         position = int(row["Position"])
@@ -505,7 +588,6 @@ def get_qualifying_results(session):
         q3_time = row["Q3"]
         full_name = row["FullName"]
 
-        # Convert pandas Timedelta objects to seconds (or None if NaT)
         def convert_time_to_seconds(time_val) -> str:
             if pd.isna(time_val):
                 return None
@@ -526,12 +608,10 @@ def get_qualifying_results(session):
 
 
 def get_driver_quali_telemetry(session, driver_code: str, quali_segment: str):
-    # Split Q1/Q2/Q3 sections
     q1, q2, q3 = session.laps.split_qualifying_sessions()
 
     segments = {"Q1": q1, "Q2": q2, "Q3": q3}
 
-    # Validate the segment
     if quali_segment not in segments:
         raise ValueError("quali_segment must be 'Q1', 'Q2', or 'Q3'")
 
@@ -539,22 +619,17 @@ def get_driver_quali_telemetry(session, driver_code: str, quali_segment: str):
     if segment_laps is None:
         raise ValueError(f"{quali_segment} does not exist for this session.")
 
-    # Filter laps for the driver
     driver_laps = segment_laps.pick_drivers(driver_code)
     if driver_laps.empty:
         raise ValueError(f"No laps found for driver '{driver_code}' in {quali_segment}")
 
-    # Pick fastest lap
     fastest_lap = driver_laps.pick_fastest()
-
-    # Extract telemetry with xyz coordinates
 
     if fastest_lap is None:
         raise ValueError(f"No valid laps for driver '{driver_code}' in {quali_segment}")
 
     telemetry = fastest_lap.get_telemetry()
 
-    # Guard: if telemetry has no time data, return empty
     if (
         telemetry is None
         or telemetry.empty
@@ -569,10 +644,8 @@ def get_driver_quali_telemetry(session, driver_code: str, quali_segment: str):
     max_speed = telemetry["Speed"].max()
     min_speed = telemetry["Speed"].min()
 
-    # An array of objects containing the start and end disances of each time the driver used DRS during the lap
     lap_drs_zones = []
 
-    # Build arrays directly from dataframes
     t_arr = telemetry["Time"].dt.total_seconds().to_numpy()
     x_arr = telemetry["X"].to_numpy()
     y_arr = telemetry["Y"].to_numpy()
@@ -584,21 +657,16 @@ def get_driver_quali_telemetry(session, driver_code: str, quali_segment: str):
     brake_arr = telemetry["Brake"].to_numpy()
     drs_arr = telemetry["DRS"].to_numpy()
 
-    # Recompute time bounds from the (possibly modified) telemetry times
     global_t_min = float(t_arr.min())
     global_t_max = float(t_arr.max())
 
-    # Create timeline (relative times starting at zero) and include endpoint
     timeline = np.arange(global_t_min, global_t_max + DT / 2, DT) - global_t_min
 
-    # Ensure we have at least one sample
     if t_arr.size == 0:
         return {"frames": [], "track_statuses": []}
 
-    # Shift telemetry times to same reference as timeline (relative to global_t_min)
     t_rel = t_arr - global_t_min
 
-    # Sort & deduplicate times using the relative times
     order = np.argsort(t_rel)
     t_sorted = t_rel[order]
     t_sorted_unique, unique_idx = np.unique(t_sorted, return_index=True)
@@ -614,7 +682,6 @@ def get_driver_quali_telemetry(session, driver_code: str, quali_segment: str):
     brake_sorted = brake_arr[idx_map]
     drs_sorted = drs_arr[idx_map]
 
-    # Continuous interpolation
     x_resampled = np.interp(timeline, t_sorted_unique, x_sorted)
     y_resampled = np.interp(timeline, t_sorted_unique, y_sorted)
     dist_resampled = np.interp(timeline, t_sorted_unique, dist_sorted)
@@ -626,11 +693,8 @@ def get_driver_quali_telemetry(session, driver_code: str, quali_segment: str):
     brake_resampled = np.round(np.interp(timeline, t_sorted_unique, brake_sorted), 1)
     drs_resampled = np.interp(timeline, t_sorted_unique, drs_sorted)
 
-    # Make sure that braking is between 0 and 100 so that it matches the throttle scale
-
     brake_resampled = brake_resampled * 100.0
 
-    # Forward-fill / step sampling for discrete fields (gear)
     idxs = np.searchsorted(t_sorted_unique, timeline, side="right") - 1
     idxs = np.clip(idxs, 0, len(t_sorted_unique) - 1)
     gear_resampled = gear_sorted[idxs].astype(int)
@@ -649,16 +713,13 @@ def get_driver_quali_telemetry(session, driver_code: str, quali_segment: str):
     }
 
     track_status = session.track_status
-
     formatted_track_statuses = []
 
     for status in track_status.to_dict("records"):
         seconds = timedelta.total_seconds(status["Time"])
-
-        start_time = seconds - global_t_min  # Shift to match timeline
+        start_time = seconds - global_t_min
         end_time = None
 
-        # Set the end time of the previous status
         if formatted_track_statuses:
             formatted_track_statuses[-1]["end_time"] = start_time
 
@@ -670,7 +731,7 @@ def get_driver_quali_telemetry(session, driver_code: str, quali_segment: str):
             }
         )
 
-    # 4.1. Resample weather data onto the same timeline for playback
+    # Resample qualifying weather data
     weather_resampled = None
     weather_df = getattr(session, "weather_data", None)
     if weather_df is not None and not weather_df.empty:
@@ -717,7 +778,7 @@ def get_driver_quali_telemetry(session, driver_code: str, quali_segment: str):
         except Exception as e:
             print(f"Weather data could not be processed: {e}")
 
-    # Build the frames
+    # Build frames
     frames = []
     num_frames = len(timeline)
 
@@ -750,14 +811,11 @@ def get_driver_quali_telemetry(session, driver_code: str, quali_segment: str):
             except Exception as e:
                 print(f"Failed to attach weather data to frame {i}: {e}")
 
-        # Check if drs has changed from the previous frame
-
         if i > 0:
             drs_prev = resampled_data["drs"][i - 1]
             drs_curr = resampled_data["drs"][i]
 
             if (drs_curr >= 10) and (drs_prev < 10):
-                # DRS activated
                 lap_drs_zones.append(
                     {
                         "zone_start": float(resampled_data["dist"][i]),
@@ -765,7 +823,6 @@ def get_driver_quali_telemetry(session, driver_code: str, quali_segment: str):
                     }
                 )
             elif (drs_curr < 10) and (drs_prev >= 10):
-                # DRS deactivated
                 if lap_drs_zones and lap_drs_zones[-1]["zone_end"] is None:
                     lap_drs_zones[-1]["zone_end"] = float(resampled_data["dist"][i])
 
@@ -788,8 +845,6 @@ def get_driver_quali_telemetry(session, driver_code: str, quali_segment: str):
 
         frames.append(frame_payload)
 
-    # Set the time of the final frame to the exact lap time
-
     frames[-1]["t"] = round(parse_time_string(str(fastest_lap["LapTime"])), 3)
 
     sector_times = {
@@ -804,7 +859,6 @@ def get_driver_quali_telemetry(session, driver_code: str, quali_segment: str):
         else None,
     }
 
-    # Extract tyre compound from the lap
     compound = (
         str(fastest_lap.get("Compound", "UNKNOWN"))
         if pd.notna(fastest_lap.get("Compound"))
@@ -828,7 +882,6 @@ def _process_quali_driver(args):
     print(f"Getting qualifying telemetry for driver: {driver_code}")
 
     driver_telemetry_data = {}
-
     max_speed = 0.0
     min_speed = 0.0
 
@@ -839,7 +892,6 @@ def _process_quali_driver(args):
             )
             driver_telemetry_data[segment] = segment_telemetry
 
-            # Update global max/min speed
             if segment_telemetry["max_speed"] > max_speed:
                 max_speed = segment_telemetry["max_speed"]
             if segment_telemetry["min_speed"] < min_speed or min_speed == 0.0:
@@ -849,7 +901,8 @@ def _process_quali_driver(args):
             driver_telemetry_data[segment] = {"frames": [], "track_statuses": []}
 
     print(
-        f"Finished processing qualifying telemetry for driver: {driver_code}, {session.get_driver(driver_code)['FullName']},"
+        f"Finished processing qualifying telemetry for driver: {driver_code}, "
+        f"{session.get_driver(driver_code)['FullName']},"
     )
     return {
         "driver_code": driver_code,
@@ -861,25 +914,9 @@ def _process_quali_driver(args):
 
 
 def get_quali_telemetry(session, session_type="Q"):
-    # This function is going to get the results from qualifying and the telemetry for each drivers' fastest laps in each qualifying segment
-
-    # The structure of the returned data will be:
-    # {
-    #   "results": [ { "code": driver_code, "position": position, "Q1": time, "Q2": time, "Q3": time }, ... ],
-    #   "telemetry": {
-    #       "driver_code": {
-    #           "Q1": { "frames": [ { "t": time, "x": x, "y": y, "dist": dist, "speed": speed, "gear": gear }, ... ] },
-    #           "Q2": { ... },
-    #           "Q3": { ... },
-    #       },
-    #       ...
-    #   }
-    # }
-
     event_name = str(session).replace(" ", "_")
     cache_suffix = "sprintquali" if session_type == "SQ" else "quali"
 
-    # Check if this data has already been computed
     try:
         if "--refresh-data" not in sys.argv:
             with open(
@@ -890,11 +927,9 @@ def get_quali_telemetry(session, session_type="Q"):
                 print("The replay should begin in a new window shortly!")
                 return data
     except FileNotFoundError:
-        pass  # Need to compute from scratch
+        pass
 
     qualifying_results = get_qualifying_results(session)
-
-    telemetry_data = {}
 
     max_speed = 0.0
     min_speed = 0.0
@@ -904,15 +939,14 @@ def get_quali_telemetry(session, session_type="Q"):
     }
 
     telemetry_data = {}
-
     driver_args = [(session, driver_codes[driver_no]) for driver_no in session.drivers]
 
     print(f"Processing {len(session.drivers)} drivers in parallel...")
-
     num_processes = min(cpu_count(), len(session.drivers))
 
     with Pool(processes=num_processes) as pool:
         results = pool.map(_process_quali_driver, driver_args)
+
     for result in results:
         driver_code = result["driver_code"]
         telemetry_data[driver_code] = {
@@ -925,29 +959,55 @@ def get_quali_telemetry(session, session_type="Q"):
         if result["min_speed"] < min_speed or min_speed == 0.0:
             min_speed = result["min_speed"]
 
-    # Save to the compute_data directory
+    # -------------------------------------------------------------------------
+    # OpenF1 enrichment for qualifying: add team radio events
+    # -------------------------------------------------------------------------
+    radio_events: dict = {}
+    openf1_available = False
 
+    print("Attempting OpenF1 enrichment for qualifying...")
+    try:
+        session_key = openf1.get_session_key_from_session(session)
+        if session_key:
+            driver_num_map = openf1.build_driver_number_map(session)
+            session_start_utc: float = session.date.timestamp()
+
+            # For qualifying we use global_t_min = 0 since each driver's
+            # telemetry is already relative to their own lap start.
+            radio_raw = openf1.get_team_radio(session_key)
+            if radio_raw:
+                radio_events = openf1.build_openf1_radio_events(
+                    radio_raw, driver_num_map, session_start_utc, 0.0
+                )
+                print(f"[OpenF1] Qualifying radio events loaded for {len(radio_events)} drivers.")
+
+            openf1_available = True
+            print("[OpenF1] Qualifying enrichment complete ✓")
+        else:
+            print("[OpenF1] Session key not found — using FastF1 data only.")
+    except Exception as e:
+        print(f"[OpenF1] Qualifying enrichment failed (non-critical): {e}")
+
+    # -------------------------------------------------------------------------
+    # Save to cache
+    # -------------------------------------------------------------------------
     if not os.path.exists("computed_data"):
         os.makedirs("computed_data")
 
-    with open(f"computed_data/{event_name}_{cache_suffix}_telemetry.pkl", "wb") as f:
-        pickle.dump(
-            {
-                "results": qualifying_results,
-                "telemetry": telemetry_data,
-                "max_speed": max_speed,
-                "min_speed": min_speed,
-            },
-            f,
-            protocol=pickle.HIGHEST_PROTOCOL,
-        )
-
-    return {
+    cache_payload = {
         "results": qualifying_results,
         "telemetry": telemetry_data,
         "max_speed": max_speed,
         "min_speed": min_speed,
+        # OpenF1 extras
+        "radio_events": radio_events,
+        "openf1_available": openf1_available,
     }
+
+    with open(f"computed_data/{event_name}_{cache_suffix}_telemetry.pkl", "wb") as f:
+        pickle.dump(cache_payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    return cache_payload
 
 
 def get_race_weekends_by_year(year):
@@ -969,16 +1029,17 @@ def get_race_weekends_by_year(year):
         )
     return weekends
 
+
 def get_race_weekends_by_place(place):
     """Returns a list of past n race weekends for a given place."""
     enable_cache()
-    place=place.lower().strip()
-    weekends=[]
-    current_year=date.today().year
+    place = place.lower().strip()
+    weekends = []
+    current_year = date.today().year
 
-    for year in range(2018,current_year): #Edit according to data availability (current data till last year)
+    for year in range(2018, current_year):
         try:
-            schedule=fastf1.get_event_schedule(year)
+            schedule = fastf1.get_event_schedule(year)
         except Exception:
             continue
 
@@ -986,9 +1047,9 @@ def get_race_weekends_by_place(place):
             if event.is_testing():
                 continue
 
-            event_name=str(event["EventName"]).strip().lower()
-            
-            if place==event_name:
+            event_name = str(event["EventName"]).strip().lower()
+
+            if place == event_name:
                 weekends.append({
                     "round_number": event["RoundNumber"],
                     "event_name": event["EventName"],
@@ -999,25 +1060,26 @@ def get_race_weekends_by_place(place):
                 })
     return weekends
 
-def get_all_unique_race_names(start_year=2018, end_year=2025): #update as necessary
+
+def get_all_unique_race_names(start_year=2018, end_year=2025):
     "Return a list of all unique race locations"
     enable_cache()
-    race_names=set()
-    
-    for year in range(start_year, end_year+1):
+    race_names = set()
+
+    for year in range(start_year, end_year + 1):
         try:
-            schedule=fastf1.get_event_schedule(year)
+            schedule = fastf1.get_event_schedule(year)
         except Exception:
             continue
 
-        for _,event in schedule.iterrows():
+        for _, event in schedule.iterrows():
             if event.is_testing():
                 continue
-
-            name=str(event["EventName"]).strip()
+            name = str(event["EventName"]).strip()
             race_names.add(name)
 
     return sorted(race_names)
+
 
 def list_rounds(year):
     """Lists all rounds for a given year."""
